@@ -1,282 +1,461 @@
-document.addEventListener("DOMContentLoaded", () => {
-  chrome.storage.local.get(["openai_key"], (res) => {
+/**
+ * Screen Pilot Popup - Voice-to-action UI with hold-to-talk recording
+ * Manages microphone input, audio recording, and TTS feedback
+ */
+
+// ============================================================================
+// Configuration & Constants
+// ============================================================================
+
+const CONFIG = {
+  VAD_POLL_MS: 100,      // Voice activity detection polling interval (ms)
+  VAD_THRESHOLD: 0.02,   // RMS amplitude threshold for speech detection
+};
+
+// ============================================================================
+// State Management
+// ============================================================================
+
+const state = {
+  spaceHeld: false,
+  recorder: null,
+  stream: null,
+  isSpeaking: false,
+  audioContext: null,
+  analyser: null,
+  sourceNode: null,
+  vadInterval: null,
+  voiceDetected: false,
+};
+
+// ============================================================================
+// DOM Initialization & Event Setup
+// ============================================================================
+
+document.addEventListener('DOMContentLoaded', () => {
+  initializeUI();
+  setupEventListeners();
+});
+
+/**
+ * Initialize UI by restoring saved API key and setting initial state
+ */
+function initializeUI() {
+  chrome.storage.local.get(['openai_key'], (res) => {
     if (res.openai_key) {
-      document.getElementById("apiKeyInput").value = res.openai_key;
+      document.getElementById('apiKeyInput').value = res.openai_key;
     }
   });
   setStatus('Idle');
-  // stop speaking button
-  const stopSpeakBtn = document.getElementById('stopSpeak');
-  if(stopSpeakBtn){
-    stopSpeakBtn.addEventListener('click', () => {
-      try{ chrome.tts.stop(); setStatus('Stopped speaking'); }catch(e){ console.error(e); }
-      stopSpeakBtn.style.display = 'none';
-      _isSpeaking = false;
-    });
-  }
-});
+}
 
-document.getElementById("saveKeyBtn").addEventListener("click", () => {
-  const key = document.getElementById("apiKeyInput").value.trim();
+/**
+ * Setup all event listeners for buttons, keyboard, and service worker messages
+ */
+function setupEventListeners() {
+  document.getElementById('saveKeyBtn').addEventListener('click', handleSaveKey);
+
+  const stopSpeakBtn = document.getElementById('stopSpeak');
+  if (stopSpeakBtn) {
+    stopSpeakBtn.addEventListener('click', handleStopSpeaking);
+  }
+
+  document.addEventListener('keydown', handleKeyDown);
+  document.addEventListener('keyup', handleKeyUp);
+  chrome.runtime.onMessage.addListener(handleServiceWorkerMessage);
+}
+
+// ============================================================================
+// Event Handlers
+// ============================================================================
+
+/**
+ * Handle API key save button click
+ */
+function handleSaveKey() {
+  const key = document.getElementById('apiKeyInput').value.trim();
   if (!key) {
-    alert("Please enter a valid API key.");
+    alert('Please enter a valid API key.');
     return;
   }
   chrome.storage.local.set({ openai_key: key }, () => {
-    alert("API key saved successfully.");
+    alert('API key saved successfully.');
   });
-});
+}
 
-// Start/Stop buttons removed — hold Space to talk (handled by key events below)
+/**
+ * Handle stop speaking button click
+ */
+function handleStopSpeaking() {
+  try {
+    chrome.tts.stop();
+    setStatus('Stopped speaking');
+  } catch (e) {
+    console.error('Failed to stop TTS:', e);
+  }
+  document.getElementById('stopSpeak').style.display = 'none';
+  state.isSpeaking = false;
+}
 
-// keyboard shortcuts: Space to start, Escape to stop
-// New: Hold-to-talk flow: press+hold Space to record; release Space to stop.
-let _spaceHeld = false;
-document.addEventListener('keydown', (e) => {
-  const active = document.activeElement && ['INPUT','TEXTAREA'].includes(document.activeElement.tagName);
-  if(active) return; // don't interfere when typing in inputs
+/**
+ * Handle keydown events for hold-to-talk (Space) and escape (Esc)
+ */
+function handleKeyDown(e) {
+  const isInputElement = document.activeElement && 
+    ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName);
+  if (isInputElement) return;
 
-  // Space hold -> start listening on first keydown (ignore repeats)
-  if ((e.code === 'Space' || e.key === ' ') && !e.repeat && !_spaceHeld) {
+  // Space key: start listening (hold-to-talk)
+  if ((e.code === 'Space' || e.key === ' ') && !e.repeat && !state.spaceHeld) {
     e.preventDefault();
-    _spaceHeld = true;
-    // If not already recording, start
-    if(!_recorder) startListening();
+    state.spaceHeld = true;
+    if (!state.recorder) startListening();
   }
 
-  // Escape now only stops speaking (if playing)
-  if (e.key === 'Escape' || e.code === 'Escape'){
-    if(_isSpeaking){
-      try{ chrome.tts.stop(); setStatus('Stopped speaking'); }catch(err){ console.error(err); }
-      const sb = document.getElementById('stopSpeak'); if(sb) sb.style.display = 'none';
-      _isSpeaking = false;
+  // Escape key: stop speaking
+  if (e.key === 'Escape' || e.code === 'Escape') {
+    if (state.isSpeaking) {
+      handleStopSpeaking();
     }
   }
-});
+}
 
-// Stop listening when Space is released
-document.addEventListener('keyup', (e) => {
-  if ((e.code === 'Space' || e.key === ' ') && _spaceHeld) {
+/**
+ * Handle keyup events to stop recording when Space is released
+ */
+function handleKeyUp(e) {
+  if ((e.code === 'Space' || e.key === ' ') && state.spaceHeld) {
     e.preventDefault();
-    _spaceHeld = false;
-    if(_recorder) stopListening('stopped (space released)');
+    state.spaceHeld = false;
+    if (state.recorder) stopListening('stopped (space released)');
   }
-});
+}
 
-let _recorder = null;
-let _stream = null;
-let _isSpeaking = false;
-let _audioContext = null;
-let _analyser = null;
-let _sourceNode = null;
-let _vadInterval = null;
-let _lastSoundTime = 0;
-let _isVoiceDetected = false;
-const VAD_POLL_MS = 100;
-const VAD_THRESHOLD = 0.02; // amplitude threshold
+/**
+ * Handle STATUS messages from service worker
+ */
+function handleServiceWorkerMessage(msg) {
+  if (!msg || msg.type !== 'STATUS' || !msg.payload) return;
 
-function startListening(){
-  // avoid duplicate starts
-  if(_recorder) return;
-  (async ()=>{
+  const status = msg.payload.status;
+  setStatus(status);
+
+  // Show spinner for active statuses
+  const activeStatuses = ['transcribing', 'interpreting', 'requesting_screen', 'interpreting_compact'];
+  if (activeStatuses.includes(status)) {
+    showSpinner(true, status.charAt(0).toUpperCase() + status.slice(1));
+  } else if (status === 'speaking') {
+    showSpinner(true, 'Speaking...');
+    const stopSpeakBtn = document.getElementById('stopSpeak');
+    if (stopSpeakBtn) stopSpeakBtn.style.display = 'inline-block';
+    state.isSpeaking = true;
+  } else if (['completed', 'error', 'no screen'].includes(status)) {
+    showSpinner(false);
+    const stopSpeakBtn = document.getElementById('stopSpeak');
+    if (stopSpeakBtn) stopSpeakBtn.style.display = 'none';
+    state.isSpeaking = false;
+  }
+}
+
+// ============================================================================
+// Microphone & Recording Control
+// ============================================================================
+
+/**
+ * Start listening for audio input
+ */
+function startListening() {
+  // Prevent duplicate starts
+  if (state.recorder) return;
+
+  (async () => {
     try {
       setStatus('Acquiring microphone...');
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      _stream = stream;
+      state.stream = stream;
       const recorder = new MediaRecorder(stream);
-      _recorder = recorder;
+      state.recorder = recorder;
       let chunks = [];
 
-      recorder.ondataavailable = e => chunks.push(e.data);
+      recorder.ondataavailable = (e) => chunks.push(e.data);
 
       recorder.onstop = async () => {
         setStatus('Sending audio...');
         showSpinner(false);
-        const blob = new Blob(chunks, { type: "audio/webm" });
+        const blob = new Blob(chunks, { type: 'audio/webm' });
         const buf = await blob.arrayBuffer();
-        _recorder = null;
-        // cleanup VAD and audio context
-        try{ if(_vadInterval) clearInterval(_vadInterval); }catch(e){}
-        _vadInterval = null;
-        try{ if(_audioContext) { _audioContext.close().catch(()=>{}); } }catch(e){}
-        _audioContext = null; _analyser = null; _sourceNode = null;
-        try{ stopStream(_stream); }catch(e){}
-        _stream = null;
-        // no fixed timeouts—hold-to-talk controls stopping
-
-        // send audio and wait for service worker response
-        chrome.runtime.sendMessage({
-          type: "AUDIO_DATA",
-          payload: { audioBytes: [...new Uint8Array(buf)] }
-        }, (response) => {
-          if (chrome.runtime.lastError) {
-            setStatus('Error: ' + chrome.runtime.lastError.message);
-            return;
-          }
-          if (!response) {
-            setStatus('No response from background');
-            return;
-          }
-          if (response.error) {
-            setStatus('Error: ' + response.error + (response.code?(' ('+response.code+')') : ''));
-            showResult(response);
-            return;
-          }
-
-          setStatus('Completed');
-          showResult(response);
-          // ready for next hold-to-talk
-        });
+        state.recorder = null;
+        cleanupAudio();
+        sendAudioToServiceWorker(buf);
       };
 
-      // UI: we don't show start/stop buttons; use hold-to-talk instead
+      // UI: hold-to-talk mode (no start/stop buttons needed)
       setStatus('Listening...');
-      showResult(null);
+      clearResult();
       showSpinner(true, 'Listening...');
-
-      // start recording
       recorder.start();
-
-      // Setup simple VAD (voice activity detection) to update UI only
-      try{
-        _audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        _sourceNode = _audioContext.createMediaStreamSource(stream);
-        _analyser = _audioContext.createAnalyser();
-        _analyser.fftSize = 2048;
-        _sourceNode.connect(_analyser);
-        const data = new Uint8Array(_analyser.fftSize);
-        _lastSoundTime = Date.now();
-        let consecutiveFrames = 0;
-        _vadInterval = setInterval(()=>{
-          _analyser.getByteTimeDomainData(data);
-          // compute normalized RMS
-          let sum = 0;
-          for(let i=0;i<data.length;i++){
-            const v = (data[i] - 128) / 128;
-            sum += v*v;
-          }
-          const rms = Math.sqrt(sum / data.length);
-          if(rms > VAD_THRESHOLD){
-            consecutiveFrames++;
-            _lastSoundTime = Date.now();
-            if(consecutiveFrames > 1){
-              // user is speaking
-              // update UI to indicate speech activity but DO NOT stop on silence
-              _isVoiceDetected = true;
-              setStatus('Recording...');
-              showSpinner(true, 'Recording...');
-            }
-          } else {
-            consecutiveFrames = 0;
-            if(_isVoiceDetected){
-              // user became silent; keep listening (hold-to-talk still controls stop)
-              _isVoiceDetected = false;
-              setStatus('Listening...');
-              showSpinner(true, 'Listening...');
-            }
-          }
-          // NOTE: We intentionally do NOT stop listening on silence; user must release Space or press Stop.
-        }, VAD_POLL_MS);
-      } catch(e){
-        // VAD not available; we'll still follow hold-to-talk behavior
-        console.warn('VAD setup failed; continuing without speech-activity UI', e);
-      }
+      setupVoiceActivityDetection();
     } catch (err) {
       setStatus('Error: ' + err.message);
-      _recorder = null;
-      try{ stopStream(_stream); }catch(e){}
-      _stream = null;
+      state.recorder = null;
+      try {
+        stopStream(state.stream);
+      } catch (e) {
+        console.error('Error stopping stream:', e);
+      }
+      state.stream = null;
     }
   })();
 }
 
-function stopListening(reason){
-  if(!_recorder) return;
-  try{ _recorder.stop(); }catch(e){}
-  // clear vad and timeouts immediately
-  try{ if(_vadInterval) clearInterval(_vadInterval); }catch(e){}
-  _vadInterval = null;
-  try{ showSpinner(false); }catch(e){}
-  setStatus(reason || 'stopped');
-  try{ if(_audioContext){ _audioContext.close().catch(()=>{}); } }catch(e){}
-  _audioContext = null; _analyser = null; _sourceNode = null;
-}
-
-function stopStream(stream){
-  if(!stream) return;
-  stream.getTracks().forEach(t=>{ try{ t.stop(); }catch(e){} });
-}
-
-// listen for STATUS messages from background/service worker
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.type === 'STATUS' && msg.payload && msg.payload.status) {
-    const s = msg.payload.status;
-    setStatus(s);
-    // show spinner for active statuses
-    if(s === 'transcribing' || s === 'interpreting' || s === 'requesting_screen' || s === 'interpreting_compact'){
-      showSpinner(true, s.charAt(0).toUpperCase() + s.slice(1));
-    } else if(s === 'speaking'){
-      showSpinner(true, 'Speaking...');
-      const sb = document.getElementById('stopSpeak'); if(sb) sb.style.display = 'inline-block';
-      _isSpeaking = true;
-    } else if(s === 'completed' || s === 'error' || s === 'no screen'){
-      showSpinner(false);
-      const sb = document.getElementById('stopSpeak'); if(sb) sb.style.display = 'none';
-      _isSpeaking = false;
-    }
+/**
+ * Stop listening and cleanup resources
+ */
+function stopListening(reason) {
+  if (!state.recorder) return;
+  try {
+    state.recorder.stop();
+  } catch (e) {
+    console.error('Error stopping recorder:', e);
   }
-});
-
-function setStatus(txt){
-  const el = document.getElementById('status');
-  if(el) el.textContent = 'Status: ' + txt;
+  cleanupAudio();
+  try {
+    showSpinner(false);
+  } catch (e) {
+    console.error('Error hiding spinner:', e);
+  }
+  setStatus(reason || 'stopped');
 }
 
-function showSpinner(visible, text){
+/**
+ * Cleanup audio resources (VAD, audio context, stream)
+ */
+function cleanupAudio() {
+  try {
+    if (state.vadInterval) clearInterval(state.vadInterval);
+  } catch (e) {
+    console.error('Error clearing VAD interval:', e);
+  }
+  state.vadInterval = null;
+
+  try {
+    if (state.audioContext) {
+      state.audioContext.close().catch(() => {});
+    }
+  } catch (e) {
+    console.error('Error closing audio context:', e);
+  }
+  state.audioContext = null;
+  state.analyser = null;
+  state.sourceNode = null;
+
+  try {
+    stopStream(state.stream);
+  } catch (e) {
+    console.error('Error stopping stream:', e);
+  }
+  state.stream = null;
+}
+
+/**
+ * Stop all audio tracks in the stream
+ */
+function stopStream(stream) {
+  if (!stream) return;
+  stream.getTracks().forEach((track) => {
+    try {
+      track.stop();
+    } catch (e) {
+      console.error('Error stopping track:', e);
+    }
+  });
+}
+
+/**
+ * Send audio buffer to service worker for transcription and interpretation
+ */
+function sendAudioToServiceWorker(buf) {
+  chrome.runtime.sendMessage({
+    type: 'AUDIO_DATA',
+    payload: { audioBytes: [...new Uint8Array(buf)] }
+  }, (response) => {
+    if (chrome.runtime.lastError) {
+      setStatus('Error: ' + chrome.runtime.lastError.message);
+      return;
+    }
+    if (!response) {
+      setStatus('No response from background');
+      return;
+    }
+    if (response.error) {
+      const code = response.code ? ` (${response.code})` : '';
+      setStatus(`Error: ${response.error}${code}`);
+      showResult(response);
+      return;
+    }
+
+    setStatus('Completed');
+    showResult(response);
+  });
+}
+
+// ============================================================================
+// Voice Activity Detection (VAD)
+// ============================================================================
+
+/**
+ * Setup voice activity detection to provide UI feedback during recording
+ */
+function setupVoiceActivityDetection() {
+  try {
+    state.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    state.sourceNode = state.audioContext.createMediaStreamSource(state.stream);
+    state.analyser = state.audioContext.createAnalyser();
+    state.analyser.fftSize = 2048;
+    state.sourceNode.connect(state.analyser);
+
+    const data = new Uint8Array(state.analyser.fftSize);
+    let consecutiveFrames = 0;
+
+    state.vadInterval = setInterval(() => {
+      state.analyser.getByteTimeDomainData(data);
+      const rms = calculateRMS(data);
+
+      if (rms > CONFIG.VAD_THRESHOLD) {
+        consecutiveFrames++;
+        if (consecutiveFrames > 1 && !state.voiceDetected) {
+          state.voiceDetected = true;
+          setStatus('Recording...');
+          showSpinner(true, 'Recording...');
+        }
+      } else {
+        consecutiveFrames = 0;
+        if (state.voiceDetected) {
+          state.voiceDetected = false;
+          setStatus('Listening...');
+          showSpinner(true, 'Listening...');
+        }
+      }
+    }, CONFIG.VAD_POLL_MS);
+  } catch (e) {
+    console.warn('VAD setup failed; continuing without speech detection UI', e);
+  }
+}
+
+/**
+ * Calculate RMS (Root Mean Square) amplitude from audio data
+ */
+function calculateRMS(data) {
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) {
+    const normalized = (data[i] - 128) / 128;
+    sum += normalized * normalized;
+  }
+  return Math.sqrt(sum / data.length);
+}
+
+// ============================================================================
+// UI Utilities
+// ============================================================================
+
+/**
+ * Update status text display
+ */
+function setStatus(txt) {
+  const el = document.getElementById('statusText');
+  if (el) el.textContent = txt;
+}
+
+/**
+ * Show or hide the animated spinner
+ */
+function showSpinner(visible, text) {
   const spinner = document.getElementById('spinner');
   const spinnerText = document.getElementById('spinnerText');
-  if(!spinner) return;
-  spinner.style.display = visible ? 'block' : 'none';
-  if(visible && spinnerText && text) spinnerText.textContent = text;
+  if (!spinner) return;
+
+  if (visible) {
+    spinner.classList.add('active');
+    if (spinnerText && text) spinnerText.textContent = text;
+  } else {
+    spinner.classList.remove('active');
+  }
 }
 
-function showResult(obj){
+/**
+ * Display result from service worker (actions or error)
+ */
+function showResult(obj) {
   const container = document.getElementById('result');
   const summary = document.getElementById('summary');
   const raw = document.getElementById('raw');
-  if(!container) return;
-  if(!obj){ container.style.display = 'none'; summary.style.display='none'; raw.textContent = ''; return; }
-  container.style.display = 'block';
-  // if LLM returned a summary action, render nicely
-  if(obj.action && obj.action.action === 'summary'){
+  if (!container) return;
+
+  if (!obj) {
+    clearResult();
+    return;
+  }
+
+  container.classList.remove('hidden');
+
+  // If LLM returned a summary action, render it nicely with replay button
+  if (obj.action && obj.action.action === 'summary') {
     const text = obj.action.value || '';
-    summary.style.display = 'block';
+    summary.classList.remove('hidden');
     summary.textContent = text;
-    // replay button
-    let existing = document.getElementById('replaySpeak');
-    if(existing) existing.remove();
-    const btn = document.createElement('button');
-    btn.id = 'replaySpeak';
-    btn.className = 'btn';
-    btn.style.marginTop = '8px';
-    btn.textContent = 'Replay';
-    btn.addEventListener('click', ()=>{
-      try{ chrome.tts.speak(text); }catch(e){ console.error(e); }
-    });
-    summary.appendChild(document.createElement('div'));
+
+    removeExistingReplayButton();
+    const btn = createReplayButton(text);
     summary.appendChild(btn);
-    // show raw JSON below as well
+
     raw.textContent = JSON.stringify(obj, null, 2);
   } else {
-    summary.style.display='none';
+    summary.classList.add('hidden');
     raw.textContent = JSON.stringify(obj, null, 2);
   }
 }
 
-function disableStart(){
-  // removed - hold-to-talk only
+/**
+ * Clear result display
+ */
+function clearResult() {
+  const container = document.getElementById('result');
+  const summary = document.getElementById('summary');
+  const raw = document.getElementById('raw');
+
+  if (container) container.classList.add('hidden');
+  if (summary) {
+    summary.classList.add('hidden');
+    summary.textContent = '';
+    removeExistingReplayButton();
+  }
+  if (raw) raw.textContent = '';
 }
 
-function enableStart(){
-  // removed - hold-to-talk only
+/**
+ * Remove any existing replay button from summary
+ */
+function removeExistingReplayButton() {
+  const existing = document.getElementById('replaySpeak');
+  if (existing) existing.remove();
+}
+
+/**
+ * Create a replay button for TTS summary
+ */
+function createReplayButton(text) {
+  const btn = document.createElement('button');
+  btn.id = 'replaySpeak';
+  btn.className = 'btn';
+  btn.style.marginTop = '8px';
+  btn.textContent = 'Replay';
+  btn.addEventListener('click', () => {
+    try {
+      // Enable SSML parsing for richer speech output
+      chrome.tts.speak(text, { enqueue: false, lang: 'en-US' });
+    } catch (e) {
+      console.error('Error replaying TTS:', e);
+    }
+  });
+  return btn;
 }
